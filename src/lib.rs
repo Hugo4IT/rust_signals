@@ -1,7 +1,34 @@
 use std::{
     cell::Cell,
+    fmt::Debug,
     ops::{Deref, DerefMut},
 };
+
+pub trait SignalDeriveBase {
+    type Generation: Debug + Clone + Copy;
+    type Value: Copy;
+
+    fn compare_generation(&self, other: Self::Generation) -> bool;
+    fn current_generation(&self) -> Self::Generation;
+    fn get(&self) -> Self::Value;
+}
+
+pub trait AsSignalDeriveBase {
+    type DeriveBase: SignalDeriveBase;
+
+    fn as_derive_base(&self) -> Self::DeriveBase;
+}
+
+pub trait Derive<Output: Copy>: AsSignalDeriveBase {
+    fn derive<F>(&self, function: F) -> Derived<Self::DeriveBase, Output>
+    where
+        F: Fn(<Self::DeriveBase as SignalDeriveBase>::Value) -> Output + 'static,
+    {
+        Derived::new(self.as_derive_base(), function)
+    }
+}
+
+impl<Output: Copy, T: AsSignalDeriveBase> Derive<Output> for T {}
 
 #[derive(Debug)]
 pub struct Signal<T> {
@@ -45,16 +72,14 @@ impl<T> Signal<T> {
     pub fn generation(&self) -> u32 {
         self.generation
     }
+}
 
-    pub fn derive<O: Copy, F: Fn(&T) -> O>(&self, function: F) -> Derived<T, O, F> {
-        let output = Cell::new(function(self.get()));
-        let output_gen = self.generation;
+impl<T: Copy> AsSignalDeriveBase for Signal<T> {
+    type DeriveBase = SignalRef<T>;
 
-        Derived {
-            input: self as *const Signal<T>,
-            output,
-            output_gen,
-            function,
+    fn as_derive_base(&self) -> Self::DeriveBase {
+        Self::DeriveBase {
+            inner: self as *const Signal<T>,
         }
     }
 }
@@ -73,23 +98,127 @@ impl<T> DerefMut for Signal<T> {
     }
 }
 
-#[derive(Debug)]
-pub struct Derived<T, O: Copy, F: Fn(&T) -> O> {
-    input: *const Signal<T>,
-    output: Cell<O>,
-    output_gen: u32,
-    function: F,
+pub struct SignalRef<T> {
+    inner: *const Signal<T>,
 }
 
-impl<T, O: Copy, F: Fn(&T) -> O> Derived<T, O, F> {
-    pub fn get(&self) -> O {
-        let signal = unsafe { &*self.input as &Signal<T> };
+impl<T: Copy> SignalDeriveBase for SignalRef<T> {
+    type Generation = u32;
+    type Value = T;
 
-        if self.output_gen != signal.generation() {
-            self.output.set((self.function)(signal.get()));
+    fn compare_generation(&self, other: Self::Generation) -> bool {
+        self.current_generation() == other
+    }
+
+    fn current_generation(&self) -> Self::Generation {
+        unsafe { &*self.inner as &Signal<T> }.generation()
+    }
+
+    fn get(&self) -> Self::Value {
+        *unsafe { &*self.inner as &Signal<T> }.get()
+    }
+}
+
+pub struct Derived<Base: SignalDeriveBase, Output: Copy> {
+    base: Base,
+    output: Signal<Cell<Output>>,
+    output_gen: Base::Generation,
+    function: Box<dyn Fn(Base::Value) -> Output>,
+}
+
+impl<Base: SignalDeriveBase, Output: Copy + Debug> Debug for Derived<Base, Output> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Derived")
+            .field("output", &self.output)
+            .field("output_gen", &self.output_gen)
+            .finish()
+    }
+}
+
+impl<Base: SignalDeriveBase, Output: Copy> Derived<Base, Output> {
+    pub(crate) fn new<F: Fn(Base::Value) -> Output + 'static>(base: Base, function: F) -> Self {
+        let output = Signal::new(Cell::new(function(base.get())));
+        let output_gen = base.current_generation();
+        let function = Box::new(function);
+
+        Derived {
+            base,
+            output,
+            output_gen,
+            function,
+        }
+    }
+
+    pub fn output_signal(&self) -> &Signal<Cell<Output>> {
+        &self.output
+    }
+
+    pub fn get(&self) -> Output {
+        if self.input_changed() {
+            (*self.output).set((self.function)(self.base.get()));
         }
 
-        self.output.get()
+        (*self.output).get()
+    }
+
+    pub fn input_changed(&self) -> bool {
+        !self.base.compare_generation(self.output_gen)
+    }
+}
+
+impl<Base: SignalDeriveBase, Output: Copy> AsSignalDeriveBase for Derived<Base, Output> {
+    type DeriveBase = DerivedSignalRef<Output>;
+
+    fn as_derive_base(&self) -> Self::DeriveBase {
+        Self::DeriveBase {
+            inner: &self.output as *const Signal<Cell<Output>>,
+        }
+    }
+}
+
+pub struct DerivedSignalRef<T: Copy> {
+    inner: *const Signal<Cell<T>>,
+}
+
+impl<T: Copy> SignalDeriveBase for DerivedSignalRef<T> {
+    type Generation = u32;
+    type Value = T;
+
+    fn compare_generation(&self, other: Self::Generation) -> bool {
+        self.current_generation() == other
+    }
+
+    fn current_generation(&self) -> Self::Generation {
+        unsafe { &*self.inner as &Signal<Cell<T>> }.generation()
+    }
+
+    fn get(&self) -> Self::Value {
+        unsafe { &*self.inner as &Signal<Cell<T>> }.get().get()
+    }
+}
+
+impl<A: AsSignalDeriveBase, B: AsSignalDeriveBase> AsSignalDeriveBase for (&A, &B) {
+    type DeriveBase = (A::DeriveBase, B::DeriveBase);
+
+    fn as_derive_base(&self) -> Self::DeriveBase {
+        (self.0.as_derive_base(), self.1.as_derive_base())
+    }
+}
+
+impl<A: SignalDeriveBase, B: SignalDeriveBase> SignalDeriveBase for (A, B) {
+    type Generation = (A::Generation, B::Generation);
+    type Value = (A::Value, B::Value);
+
+    fn compare_generation(&self, other: Self::Generation) -> bool {
+        self.0.compare_generation(other.0) && self.1.compare_generation(other.1)
+    }
+
+    fn current_generation(&self) -> Self::Generation {
+        (self.0.current_generation(), self.1.current_generation())
+    }
+
+    fn get(&self) -> Self::Value {
+        (self.0.get(), self.1.get())
     }
 }
 
@@ -99,6 +228,8 @@ mod tests {
 
     #[test]
     fn test_memos() {
+        use crate::Derive;
+
         let mut number = Signal::new(1);
         let double = number.derive(|number| number * 2);
 
